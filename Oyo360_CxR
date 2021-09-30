@@ -1,0 +1,313 @@
+library(RPresto)
+library(RPostgreSQL)
+library(doBy)
+library(caroline)
+library(Metrics)
+library(locfit)
+library(quadprog)
+library(pracma)
+library(data.table)
+library(dplyr)
+library(RPostgreSQL)
+library(cellranger)
+library(googledrive)
+library(googlesheets4)
+library(googlesheets)
+library(lubridate)
+library(rlang)
+library(botor)
+library(data.table)
+library(dplyr) 
+library(RPresto)
+library(lubridate)
+library(RPostgreSQL)
+
+
+prestd <- dbConnect(
+  RPresto::Presto(),
+  host='http://presto.oyorooms.io',
+  port=8889,
+  user='shreyash.gupta@oyorooms.com',
+  schema='default',
+  catalog='hive')
+drv <- dbDriver("PostgreSQL")
+
+end_date <- Sys.Date() - 1
+
+start_date <- as.Date("2021-09-01")
+country_name <- 'India'
+
+library(googlesheets4)
+##gs4_auth(path = "C:/Users/Oyo/Documents/raghib-64166-9881ac74c961.json")
+temp.file <- tempfile()
+google.token <- s3_download_file("s3://prod-datapl-r-scheduler/team/global_revenue_excellence/md.raghib/credentials/raghib-64166-9881ac74c961.json", temp.file)
+gs4_auth(path = google.token)
+
+#oyo 360 prop##
+Oyo360_prop <- dbGetQuery(prestd,statement = paste0("select h.d, h.oyo_id, sum(sellable_rooms) as srn  from aggregatedb.hotel_date_summary h
+left join pomsi.leads_base as lb on h.oyo_id = lb.existing_oyo_oyoid  
+where
+h.country_id=1
+and lb.sub_source in ('Merchant On-boarding')
+and h.d between date '",start_date,"' and date '",end_date,"'
+group by 1,2 order by 1,2 desc"))
+Oyo360_prop$d <- NULL
+Oyo360_prop = Oyo360_prop[!duplicated(Oyo360_prop[,c("oyo_id")]), ]
+
+
+bookings<-dbGetQuery(prestd,statement = paste0("
+                                                select invoice_no, h.oyo_id, h.oyo_product, b.coupon_code,
+                                                date(try_cast(substr(b.created_at,1,19) as timestamp) + interval '330' minute) as created_at, date(b.checkin) as checkin, date(b.checkout) as checkout,
+                                                oyo_rooms as rooms,
+                                                (case when b.selling_amount >0 then b.selling_amount else b.amount end)-coalesce(b.discount,0) as gmv,
+                                                st.enum_val as booking_status, so.enum_val as source,
+                                                CASE WHEN amountprepaid<=0 or amountprepaid is null THEN 'PAH'
+                                                    WHEN amountprepaid>0 and amountprepaid<(amount-coalesce(discount,0)) THEN 'Prepaid'
+                                                    WHEN amountprepaid>=(amount-coalesce(discount,0)) THEN 'Prepaid' END AS prepaid_pah
+                                                from (select * from ingestiondb.bookings_base where date(try_cast(substr(created_at,1,19) as timestamp)) > date '2021-01-31'
+                                                 and inserted_at>'202106') b
+                                         LEFT JOIN aggregatedb.hotels_summary h on h.hotel_id = b.hotel_id
+                                                LEFT JOIN
+                                                  (select * from aggregatedb.enums
+                                                  where table_name = 'bookings' and column_name='status') st on st.enum_key = b.status
+                                                LEFT JOIN
+                                                  (select * from aggregatedb.enums
+                                                  where table_name = 'bookings' and column_name='source') so on so.enum_key = b.SOURCE
+                                                LEFT JOIN
+                                                  (select * from aggregatedb.enums
+                                                  where table_name = 'bookings' and column_name='payment_status') py on py.enum_key = b.payment_status
+ 
+                                                LEFT JOIN
+                                                  (select p.booking_id as bid,
+                                                  sum(case when p.payment_type = 0 and cast(p.created_at as date)<=date(b.checkin)
+                                                      then p.amount else 0 end)
+                                                  - sum(case when p.payment_type = 1 and cast(p.created_at as date)<=date(b.checkin)
+                                                      then p.amount else 0 end) as amountprepaid
+                                                  from ordering_realtime.payment_transacs p
+                                                  join ordering_realtime.bookings b on b.id=p.booking_id and p.created_at is not NULL
+                                                  where p.status= 1
+                                                  and p.merchant not in (values 0,1,16,17,2,31,34,35,37,42,44,45,46,47,48,49,50,56,57,6,65,67,73)
+                                                  and p.inserted_at>'202106'
+                                                  group by p.booking_id
+                                                  ) as A on A.bid = b.id
+                                               
+                                               where h.country_name in ('India')
+                                and date(b.checkin)>= date '2021-06-30'
+                                and date(try_cast(substr(b.created_at,1,19) as timestamp)) > date '2021-06-30'
+                                and b.inserted_at>'202106'
+                                and b.source in (values 22,23)
+                                and st.enum_val <> 'Unprocessed'
+                                order by created_at desc
+                                                "))
+
+
+bookings_360 <- subset(bookings, bookings$oyo_id %in% Oyo360_prop$oyo_id)
+
+bookings_360$booking_status <- ifelse(bookings_360$booking_status %in% c("Checked In","Checked Out"),"Realised",bookings_360$booking_status)
+
+bookings_360 = bookings_360[!duplicated(bookings_360[,c("invoice_no")]), ]
+bookings_360$count <- 1
+bookings_360 = subset(bookings_360,!(bookings_360$source %in% c("Direct")))
+bookings_360 = subset(bookings_360,!(bookings_360$booking_status %in% c("Saved")))
+
+#write.csv(bookings_360,"bookings_360.csv",row.names = F)
+
+booking_level <- bookings_360 %>%  group_by(created_at) %>% 
+  summarise(
+    pre_books = sum(count * (prepaid_pah == "Prepaid")),
+    pah_books = sum(count * (prepaid_pah == "PAH")),
+    tot_books = sum(count)
+  ) %>% arrange(created_at) 
+
+booking_level_checkin <- bookings_360 %>%  group_by(checkin) %>% 
+  summarise(
+    pre_books_checkin = sum(count * (prepaid_pah == "Prepaid")),
+    pah_books_checkin = sum(count * (prepaid_pah == "PAH")),
+    tot_books_checkin = sum(count)
+  ) %>% arrange(checkin) 
+
+created_brn <- bookings_360 %>%  group_by(created_at) %>%
+  summarise(
+    pre_brn = sum(rooms * (prepaid_pah == "Prepaid")),
+    pah_brn = sum(rooms * (prepaid_pah == "PAH")),
+    tot_brn = sum(rooms),
+    pre_urn = sum(rooms * (prepaid_pah == "Prepaid") * (booking_status == "Realised")),
+    pah_urn = sum(rooms * (prepaid_pah == "PAH") * (booking_status == "Realised")),
+    tot_urn = sum(rooms * (booking_status == "Realised")),
+    pre_cnf = sum(rooms * (prepaid_pah == "Prepaid") * (booking_status == "Confirm Booking")),
+    pah_cnf = sum(rooms * (prepaid_pah == "PAH") * (booking_status == "Confirm Booking")),
+    tot_cnf = sum(rooms * (booking_status == "Confirm Booking"))  
+  ) %>% arrange(created_at) 
+
+checkin_brn <- bookings_360 %>%  group_by(checkin) %>%
+  summarise(
+    pre_brn_checkin = sum(rooms * (prepaid_pah == "Prepaid")),
+    pah_brn_checkin = sum(rooms * (prepaid_pah == "PAH")),
+    tot_brn_checkin = sum(rooms),
+    pre_urn_checkin = sum(rooms * (prepaid_pah == "Prepaid") * (booking_status == "Realised")),
+    pah_urn_checkin = sum(rooms * (prepaid_pah == "PAH") * (booking_status == "Realised")),
+    tot_urn_checkin = sum(rooms * (booking_status == "Realised")),
+    pre_cnf_checkin = sum(rooms * (prepaid_pah == "Prepaid") * (booking_status == "Confirm Booking")),
+    pah_cnf_checkin = sum(rooms * (prepaid_pah == "PAH") * (booking_status == "Confirm Booking")),
+    tot_cnf_checkin = sum(rooms * (booking_status == "Confirm Booking"))  
+  ) %>% arrange(checkin) 
+
+
+overall <- merge(booking_level,created_brn, by = "created_at", all = T)
+overall <- merge(overall,checkin_brn, by.x = "created_at", by.y = "checkin", all = T)
+overall = subset(overall,overall$created_at < end_date)
+overall = subset(overall,overall$created_at >= start_date)
+
+#write.table(overall,"bookings.csv",row.names = F, col.names = F,sep = ",")
+SHEET_KEY = "1W_m4vusF5R3IZKoPVijzNCAdbJBpsXF3diovQW4P5VI"
+WORKSHEET_TITLE = "raw_data"
+anchor_cell_column = 1
+anchor_cell_row = 32
+range_write(ss = SHEET_KEY, data = overall , sheet = WORKSHEET_TITLE, range=R1C1_to_A1(paste0('R', anchor_cell_row, 'C', anchor_cell_column), strict=FALSE), col_names= FALSE)
+
+con2 <- dbConnect(drv, dbname="analytics",host="10.20.2.235",
+                  port=5432,user="conversion",
+                  password="d86whd029ruih36729dng6885")
+
+views <- dbGetQuery(con2,paste0("select date,s.oyo_id,prepaid
+                 ,sum(user_id) as views from (select distinct * from discover_oyo_data_views ) d
+                 left join discover_static s
+                 on s.oyo_id = d.hotel_id
+                 where date BETWEEN date '",start_date,"' and date '",end_date,"'
+                 and soldout = 0
+                 and country_name in ('India')
+                group by 1,2,3
+                order by 1,2,3
+                                ")) 
+dbDisconnect(con2)
+
+views_360 <- left_join(Oyo360_prop, views, by.x = c("oyo_id"), by.y = c("oyo_id"), all.x = T)
+
+#library(data.table)
+#setDT(views_360)[, .SD[!any(is.na(Value))] , date]
+
+library(tidyr)
+views_360 <- views_360 %>% drop_na(date)
+
+
+#views_360[is.na(views_360)] <- 0
+views_360$srn <- NULL
+x1 <- views_360 %>%  group_by(date) %>% 
+  summarise(
+    pre_views = sum(views * prepaid),
+    views = sum(views)
+  ) %>% arrange(date)
+
+#write.table(x1,"views.csv",row.names = F, col.names = F,sep = ",")
+SHEET_KEY = "1W_m4vusF5R3IZKoPVijzNCAdbJBpsXF3diovQW4P5VI"
+WORKSHEET_TITLE = "raw_data"
+anchor_cell_column = 24
+anchor_cell_row = 32
+range_write(ss = SHEET_KEY, data = x1 , sheet = WORKSHEET_TITLE, range=R1C1_to_A1(paste0('R', anchor_cell_row, 'C', anchor_cell_column), strict=FALSE), col_names= FALSE)
+
+
+######################user level############################################################
+library(bigrquery)
+#google.token <- s3_download_file("s3://prod-datapl-r-scheduler/team/global_revenue_excellence/md.raghib/data/md.raghib/bigquery01-1281-a7348b534206.json", temp.file)
+endpoint <- httr::oauth_endpoint(NULL, "auth", "token", base_url = "https://accounts.google.com/o/oauth2")
+secrets <- jsonlite::fromJSON("bigquery01-1281-a7348b534206.json")
+scope <- "https://www.googleapis.com/auth/bigquery"
+token <- httr::oauth_service_token(endpoint, secrets, scope)
+bigrquery::set_access_cred(token)
+project = "bigquery01-1281"
+
+#start_date <- as.Date(substr(Sys.time(),1,10))
+#start_date = start_date - 1
+start_date = as.Date("2021-09-01")
+end_date <- Sys.Date() - 1
+insert <- as.numeric(format(start_date, "%Y%m%d"))
+insert1 <- as.numeric(format(end_date, "%Y%m%d"))
+
+#remove discover filter##
+query = paste0("
+SELECT
+  date,
+  t.fullVisitorId,
+  t.visitId,
+  hits.hour as hour,
+  hits.eventInfo.eventLabel as eventlabel,
+  (SELECT value FROM hits.customDimensions WHERE index=45) AS user_id,
+  (SELECT value FROM hits.customDimensions WHERE index=3) AS oyo_id,
+  (SELECT value FROM hits.customDimensions WHERE index=81) AS coupon_code,
+  (SELECT value FROM hits.customDimensions WHERE index=6) AS checkin_date,
+  (SELECT value FROM hits.customDimensions WHERE index=8) AS guests,
+  (SELECT value FROM hits.customDimensions WHERE index=127) AS timestamp
+FROM
+  `bigquery01-1281.101018286.ga_sessions_*` t,
+  t.hits AS hits
+WHERE
+  hits.eventInfo.eventCategory = 'Hotel Details Page'
+  AND hits.eventInfo.eventAction ='Page Open'
+  AND _TABLE_SUFFIX BETWEEN '",insert,"' AND '",insert1,"'
+  AND geoNetwork.country = 'India'	
+  ")
+project = "bigquery01-1281"
+
+user_listA1 <- query_exec(query, project = project, use_legacy_sql = FALSE, max_pages = Inf)
+user_listA1 <- subset(user_listA1, as.numeric(user_listA1$date) <= insert)
+user_listA1 <- subset(user_listA1, as.numeric(user_listA1$date) >= insert)
+print("user list done")
+
+
+user_listA1$visitid <- NULL
+user_listA1$hour <- NULL
+user_listA1$oyo_id <- NULL
+user_listA1$checkin_date <- NULL
+user_listA1$timestamp <- NULL
+user_listA1$user_id <- NULL
+dbDisconnect(con1)
+
+Oyo360_prop1 <- dbGetQuery(prestd,statement = paste0("select h.d, h.oyo_id,h.hid as hotel_id, sum(sellable_rooms) as srn  from aggregatedb.hotel_date_summary h
+left join pomsi.leads_base as lb on h.oyo_id = lb.existing_oyo_oyoid
+where
+h.country_id=1
+and lb.sub_source in ('Merchant On-boarding')
+and h.d between date '",start_date,"' and date '",end_date,"'
+group by 1,2,3 order by 1,2 desc"))
+Oyo360_prop1$d <- NULL
+Oyo360_prop1 = Oyo360_prop1[!duplicated(Oyo360_prop1[,c("oyo_id")]), ]
+
+userlist_360 <- subset(user_listA1, user_listA1$oyo_id %in% Oyo360_prop1$hotel_id)
+
+#write.csv(user_listA1,"user_list360.csv",row.names = F)
+
+user_listA1overall<- userlist_360[!duplicated(userlist_360[,c("date","fullVisitorId","eventlabel")]), ]
+
+user_listA1overall$eventlabel = ifelse(user_listA1overall$eventlabel == "booking,","PAH",ifelse(user_listA1overall$eventlabel %in% c("prepay,","partial_prepay,","partial_prepay,prepay,"),"PRE","Others"))
+user_listA1overall = user_listA1overall[!duplicated(user_listA1overall[,c("date","fullVisitorId","eventlabel")]), ]
+user_listA1overall$count <- 1
+
+view_master <- user_listA1overall %>%  group_by(date) %>% 
+  summarise(
+    pre_view = sum(count * (eventlabel == "PRE")),
+    pah_view = sum(count * (eventlabel == "PAH"))
+  ) %>% arrange(date)
+
+
+view_master$date <- paste0(substr(view_master$date,1,4),"-",substr(view_master$date,5,6),"-",substr(view_master$date,7,8))
+
+user_listA2overall = subset(user_listA1overall, user_listA1overall$eventlabel %in% c("PRE","PAH"))
+user_listA2overall = user_listA2overall[!duplicated(user_listA2overall[,c("date","fullVisitorId")]), ]
+
+view_master1 <- user_listA2overall %>%  group_by(date) %>% 
+  summarise(
+    tot_view = sum(count),
+  ) %>% arrange(date)
+
+view_master1$date <- paste0(substr(view_master1$date,1,4),"-",substr(view_master1$date,5,6),"-",substr(view_master1$date,7,8))
+
+view_master = merge(view_master,view_master1, by = c("date"), all = T)
+
+#write.table(view_master,"user.csv", row.names = F, col.names = F,sep = ",")
+
+SHEET_KEY = "1W_m4vusF5R3IZKoPVijzNCAdbJBpsXF3diovQW4P5VI"
+WORKSHEET_TITLE = "raw_data"
+anchor_cell_column = 27
+anchor_cell_row = 32
+
+range_write(ss = SHEET_KEY, data = view_master , sheet = WORKSHEET_TITLE, range=R1C1_to_A1(paste0('R', anchor_cell_row, 'C', anchor_cell_column), strict=FALSE), col_names= FALSE)
